@@ -315,6 +315,42 @@ function findDownloadByFileId(fileId) {
   return null
 }
 
+// Content-hash cache so repeated scans (e.g. the download poll loop) don't
+// re-hash multi-GB archives every tick. Keyed by archive name; invalidated when
+// the file's size or mtime changes.
+const _downloadHashCache = new Map()
+function hashOfDownload(name) {
+  const p = path.join(getDownloadsDir(), name)
+  let st
+  try { st = fs.statSync(lp(p)) } catch { return null }
+  const cached = _downloadHashCache.get(name)
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.hash
+  let hash
+  try { hash = sha256File(p).toLowerCase() } catch { return null }
+  _downloadHashCache.set(name, { mtimeMs: st.mtimeMs, size: st.size, hash })
+  return hash
+}
+
+/**
+ * Find a finished download whose *content* matches the given sha256, regardless
+ * of its .meta. MO2 sometimes writes a download's .meta without a fileID (e.g.
+ * when the Nexus API query is rate-limited mid-batch), which makes
+ * findDownloadByFileId miss an archive that actually arrived. Matching by hash
+ * is metadata-independent, so a correctly downloaded file is never reported as
+ * "failed to download".
+ */
+function findDownloadByHash(sha256) {
+  if (!sha256) return null
+  const want = String(sha256).toLowerCase()
+  let names
+  try { names = fs.readdirSync(getDownloadsDir()) } catch { return null }
+  for (const name of names) {
+    if (/\.(meta|unfinished)$/i.test(name)) continue
+    if (hashOfDownload(name) === want) return name
+  }
+  return null
+}
+
 /** Download any URL into the MO2 downloads folder. Returns the archive name. */
 async function downloadToDownloads(url, fileName, onProgress) {
   const dest = path.join(getDownloadsDir(), fileName)
@@ -612,14 +648,17 @@ function enforceModRules() {
  * the free-account path, where archives arrive asynchronously via the nxm
  * handler after the user clicks "Mod Manager Download" on each mod page.
  *
- *   wanted: [{ fileId, name }]
+ *   wanted: [{ fileId, hash, name }]
+ *
+ * A mod counts as downloaded once an archive with its fileId OR its content
+ * hash is present, so a missing/incomplete .meta never stalls the wait.
  */
 function waitForDownloads(wanted, onProgress, signal, intervalMs = 4000, timeoutMs = 900_000) {
   const deadline = Date.now() + timeoutMs
   return new Promise((resolve, reject) => {
     function tick() {
       if (signal?.aborted) return reject(new Error('Cancelled'))
-      const waiting = wanted.filter(w => !findDownloadByFileId(w.fileId))
+      const waiting = wanted.filter(w => !findDownloadByFileId(w.fileId) && !findDownloadByHash(w.hash))
       if (onProgress) {
         onProgress(wanted.length - waiting.length, wanted.length,
           waiting.length ? `Waiting for download: ${waiting.map(w => w.name).join(', ')}` : 'All downloads received')
@@ -678,6 +717,7 @@ module.exports = {
   registerNxmHandler,
   downloadToDownloads,
   findDownloadByFileId,
+  findDownloadByHash,
   verifyArchive,
   sha256File,
   extractToCache,

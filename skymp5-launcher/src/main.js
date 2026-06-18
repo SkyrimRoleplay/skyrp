@@ -1238,6 +1238,7 @@ async function runMO2Install() {
     const locate = (a) => {
       const names = []
       if (a.source.type === 'nexus') { const n = mo2.findDownloadByFileId(a.source.fileId); if (n) names.push(n) }
+      const byHash = mo2.findDownloadByHash(a.hash); if (byHash) names.push(byHash)
       names.push(a.name)
       for (const name of names) {
         const p = path.join(downloadsDir, name)
@@ -1287,11 +1288,11 @@ async function runMO2Install() {
                (apiKey ? '' : ' (log into Nexus in the launcher for automatic downloads)'),
         index: 0, total: needBrowser.length, skipped: false,
       })
-      await mo2.waitForDownloads(needBrowser.map(a => ({ fileId: a.source.fileId, name: a.name })), (done, total, message) => {
+      await mo2.waitForDownloads(needBrowser.map(a => ({ fileId: a.source.fileId, hash: a.hash, name: a.name })), (done, total, message) => {
         send('install:progress', { phase: 'mods', file: message, index: done, total, skipped: false })
       })
       for (const a of needBrowser) {
-        const name = mo2.findDownloadByFileId(a.source.fileId)
+        const name = mo2.findDownloadByFileId(a.source.fileId) || mo2.findDownloadByHash(a.hash)
         const p = name && path.join(downloadsDir, name)
         if (!p || !mo2.verifyArchive(p, a.hash)) return fail(`${a.name}: downloaded file failed verification (wrong version?).`)
         archivePaths[a.id] = p

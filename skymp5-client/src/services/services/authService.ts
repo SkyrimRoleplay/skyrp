@@ -47,6 +47,7 @@ const translations = {
     joinDiscordServer: 'вступите в discord сервер',
     banned: 'вы забанены',
     whatWasThat: 'что это было?',
+    sessionExpired: 'сессия истекла\nвойдите снова через discord',
     openingBrowser: 'открываем браузер...',
     loginFirst: 'сначала войдите',
     linkedSuccessfully: 'привязан успешно',
@@ -75,6 +76,7 @@ const translations = {
     joinDiscordServer: 'join the Discord server',
     banned: 'you are banned',
     whatWasThat: 'what was that?',
+    sessionExpired: 'your session expired\nlog in via Discord again',
     openingBrowser: 'opening browser...',
     loginFirst: 'log in first',
     linkedSuccessfully: 'linked successfully',
@@ -161,8 +163,8 @@ export class AuthService extends ClientListener {
   private onCreateActorMessage(e: ConnectionMessage<CreateActorMessage>) {
     if (e.message.isMe) {
       if (this.authDialogOpen) {
-        logTrace(this, `Received createActorMessage for self, resetting widgets`);
-        this.sp.browser.executeJavaScript('window.skyrimPlatform.widgets.set([]);');
+        logTrace(this, `Received createActorMessage for self, dismissing auth dialog`);
+        this.dismissLoginWidget();
         this.authDialogOpen = false;
       } else {
         logTrace(this, `Received createActorMessage for self, but auth dialog was not open so not resetting widgets`);
@@ -194,6 +196,35 @@ export class AuthService extends ClientListener {
       //   logTrace(this, 'loginRequired received');
       //   this.loginWithSkympIoCredentials();
       //   break;
+      case 'characterSelectMenu':
+        // The server only offers character selection once auth has succeeded.
+        // Tear the login dialog down now so it can't linger behind the
+        // character-select menu or the race menu during character creation
+        // (the character-select menu coexists with other widgets rather than
+        // replacing the whole list, so it no longer hides the login dialog).
+        if (this.authDialogOpen) {
+          logTrace(this, 'characterSelectMenu received, dismissing auth dialog');
+          this.dismissLoginWidget();
+          this.authDialogOpen = false;
+        }
+        break;
+      case 'loginFailedSessionNotFound':
+        // The cached play session expired (sessions have a TTL on the master
+        // api). Without this case the packet was ignored and the player was
+        // silently stuck on a black login — surface it and route them back to
+        // the login dialog so they can re-authenticate via Discord and mint a
+        // fresh session (their character is keyed to a stable profileId, so
+        // nothing needs to be deleted).
+        this.authAttemptProgressIndicator = false;
+        this.controller.lookupListener(NetworkingService).close();
+        logTrace(this, 'loginFailedSessionNotFound received');
+        authData = null;
+        browserState.loginFailedReason = strings.sessionExpired;
+        browserState.comment = '';
+        this.setListenBrowserMessage(true, 'loginFailedSessionNotFound received');
+        this.loggingStartMoment = 0;
+        this.sp.browser.executeJavaScript(new FunctionInfo(this.loginFailedWidgetSetter).getText({ events, browserState, authData: authData, strings }));
+        break;
       case 'loginFailedNotLoggedViaDiscord':
         this.authAttemptProgressIndicator = false;
         this.controller.lookupListener(NetworkingService).close();
@@ -415,6 +446,20 @@ export class AuthService extends ClientListener {
   private refreshWidgets() {
     this.sp.browser.executeJavaScript(new FunctionInfo(this.browsersideWidgetSetter).getText({ events, browserState, authData: authData, strings }));
     this.authDialogOpen = true;
+  };
+
+  // Remove only the auth-owned widgets (login dialog id 1, "oops" dialog id 2),
+  // leaving any other persistent widget (e.g. chat) intact. The whole-list
+  // `widgets.set([])` reset used previously wiped those too, and — now that the
+  // character-select menu coexists with other widgets instead of replacing them
+  // — could leave the login dialog hanging behind character creation until a
+  // relog. Guard against `widgets` being nulled out by the denied-auth path.
+  private dismissLoginWidget() {
+    this.sp.browser.executeJavaScript(
+      '(function(){var w=window.skyrimPlatform.widgets;if(!w||!w.get)return;' +
+      'var ws=(w.get()||[]).filter(function(x){return x&&x.id!==1&&x.id!==2;});' +
+      'w.set(ws);})();'
+    );
   };
 
   public readAuthDataFromDisk(): RemoteAuthGameData | null {

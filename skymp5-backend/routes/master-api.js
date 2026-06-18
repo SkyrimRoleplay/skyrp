@@ -80,7 +80,12 @@ function setBalance(profileId, balance) {
 // ── In-memory session store — used for online-mode validation only ────────────
 
 const sessions      = new Map()
-const SESSION_TTL   = 24 * 60 * 60 * 1000  // 24 h
+// Sessions use a sliding 30-day window: the launcher caches one play-session
+// token and reuses it across launches, so a short fixed TTL meant returning
+// players hit "Session not found" (404) and had to wipe their data to recover.
+// The expiry is pushed forward on every successful validation (see the session
+// route), so anyone playing regularly never expires.
+const SESSION_TTL   = 30 * 24 * 60 * 60 * 1000  // 30 days
 const SESSIONS_PATH = path.join(__dirname, '..', 'data', 'sessions.json')
 
 function pruneExpired() {
@@ -207,6 +212,11 @@ router.get('/:key/sessions/:session', async (req, res) => {
   if (!access.allowed) {
     return res.status(403).json({ error: access.error || 'accessDenied' })
   }
+
+  // Sliding expiry: a session that's actively being used keeps living, so the
+  // launcher's cached token stays valid as long as the player keeps playing.
+  entry.expiresAt = Date.now() + SESSION_TTL
+  saveSessions()
 
   res.json({
     user: {
