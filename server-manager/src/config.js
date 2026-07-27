@@ -42,9 +42,9 @@ module.exports = {
   // Renamed services: migrate the live box by re-running build/dist/server/install-services.bat
   // legacyNames are pre-rename service names the manager falls back to until then.
   services: [
-    { key: 'nginx',   name: 'SkyrpNginx',      legacyNames: ['SkyMPNginx'],      label: 'Nginx'    },
-    { key: 'backend', name: 'SkyrpBackend',    legacyNames: ['SkyRP-Backend'], label: 'Backend'  },
-    { key: 'game',    name: 'SkyrpGameServer', legacyNames: [],               label: 'Game'     },
+    { key: 'nginx',   name: 'SkyrpNginx',      legacyNames: ['SkyrpNginx', 'SkyMPNginx'],      label: 'Nginx'    },
+    { key: 'backend', name: 'SkyrpBackend',    legacyNames: ['SkyrpBackend', 'SkyRP-Backend'], label: 'Backend'  },
+    { key: 'game',    name: 'SkyrpGameServer', legacyNames: ['SkyrpGameServer'],               label: 'Game'     },
   ],
 
   // Reference MO2 install used to compile the manifest (the Modlist tab).

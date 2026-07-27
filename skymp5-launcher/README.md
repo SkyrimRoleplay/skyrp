@@ -1,6 +1,6 @@
-# Skyrim Roleplay Launcher
+# SkyRP Launcher
 
-Desktop launcher for the Skyrim Roleplay SkyMP server. Handles Discord authentication, client file installation, mod management via Mod Organizer 2, and launching Skyrim through SKSE.
+Desktop launcher for the SkyRP SkyMP server. Handles Discord authentication, client file installation, mod management via Mod Organizer 2, and launching Skyrim through SKSE.
 Original by the SkyMP team: https://github.com/F02K/SkyMP-Launcher
 
 Pre-built installers are available at **https://skyrimroleplay.co.uk/**.
@@ -123,5 +123,3 @@ skips its own Discord OAuth dialog.
 ## Server lock
 
 If the backend sets `locked: true`, the Play button is disabled for users whose Discord ID is not in `lockedAllowList`. Used during maintenance or testing periods.
-</content>
-</invoke>

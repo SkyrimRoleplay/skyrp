@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import { Settings } from "../settings";
 import { System, Log, SystemContext, Content } from "./system";
 import { filterAccessForSlot } from "../backendFactionApi";
@@ -12,12 +13,48 @@ function randomInteger(min: number, max: number) {
 // Slots per player; override with the "characterSelectMaxCharacters" server setting (1-10)
 const DEFAULT_MAX_CHARACTERS = 3;
 
+// Fresh characters start with a miner's outfit and pocket change, nothing else.
+// Form ids verified against Skyrim.esm: ClothesMinerClothes, ClothesMinerBoots, Gold001.
+// Overridable via the "startingItems" server setting.
+const DEFAULT_STARTING_ITEMS = [
+  { baseId: 0x00080697, count: 1 },
+  { baseId: 0x00080699, count: 1 },
+  { baseId: 0x0000000f, count: 50 },
+];
+
+// Parse a base id that may arrive as a decimal number or a "0x..." hex string
+const toBaseId = (v: unknown): number | null => {
+  if (typeof v === "number" && Number.isFinite(v)) return v >>> 0;
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v.trim());
+    if (Number.isFinite(n)) return n >>> 0;
+  }
+  return null;
+};
+
+// Validate a "startingItems" setting into {baseId,count} stacks; null if absent or malformed
+function parseStartingItems(raw: unknown): { baseId: number; count: number }[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: { baseId: number; count: number }[] = [];
+  for (const e of raw) {
+    const baseId = toBaseId((e as { baseId?: unknown })?.baseId);
+    const count = Number((e as { count?: unknown })?.count);
+    if (baseId === null || !Number.isInteger(count) || count <= 0) return null;
+    out.push({ baseId, count });
+  }
+  return out.length ? out : null;
+}
+
+// One kit per profile+slot, persisted so delete/recreate cycling can't farm gold
+const STARTER_GRANTS_FILE = "./starter-grants.json";
+
 // characterSelectMenuRequest guards: rapid repeats are ignored, and a request right after actor assign is treated as a stale client menu event
 const REQUEST_COOLDOWN_MS = 15 * 1000;
 const ASSIGN_GRACE_MS = 10 * 1000;
 
 // Logout grace: the body stays in the world this long after disconnect/menu quit/character switch, so combat logging leaves a killable body; re-selecting cancels it
-const LOGOUT_GRACE_MS = 5 * 60 * 1000;
+// Overridable via the "logoutGraceMs" server setting.
+const DEFAULT_LOGOUT_GRACE_MS = 5 * 60 * 1000;
 
 // Character-select protocol (gated by the "characterSelect" server setting;
 // slot count via "characterSelectMaxCharacters", 1-10, default 3).
@@ -35,6 +72,8 @@ export class Spawn implements System {
 
   private characterSelect = false;
   private maxCharacters = DEFAULT_MAX_CHARACTERS;
+  private startingItems = DEFAULT_STARTING_ITEMS;
+  private logoutGraceMs = DEFAULT_LOGOUT_GRACE_MS;
   private settingsObject!: Settings;
   // userId -> auth context awaiting a character selection
   private pending = new Map<number, { profileId: number; roles: string[]; discordId?: string; access?: unknown }>();
@@ -50,9 +89,13 @@ export class Spawn implements System {
     this.settingsObject = await Settings.get();
     this.characterSelect = !!(this.settingsObject.allSettings &&
       (this.settingsObject.allSettings as Record<string, unknown>)["characterSelect"]);
-    const rawMax = Number(this.settingsObject.allSettings &&
-      (this.settingsObject.allSettings as Record<string, unknown>)["characterSelectMaxCharacters"]);
+    const all = this.settingsObject.allSettings as Record<string, unknown> | null;
+    const rawMax = Number(all && all["characterSelectMaxCharacters"]);
     if (Number.isInteger(rawMax) && rawMax >= 1 && rawMax <= 10) this.maxCharacters = rawMax;
+    const parsedItems = parseStartingItems(all?.["startingItems"]);
+    if (parsedItems) this.startingItems = parsedItems;
+    const rawGrace = Number(all?.["logoutGraceMs"]);
+    if (Number.isInteger(rawGrace) && rawGrace >= 0) this.logoutGraceMs = rawGrace;
 
     const listenerFn = (userId: number, userProfileId: number, discordRoleIds: string[], discordId?: string, access?: unknown) => {
       if (this.characterSelect) {
@@ -93,7 +136,7 @@ export class Spawn implements System {
     } catch { /* form vanished */ }
   }
 
-  // Disable the body LOGOUT_GRACE_MS from now unless re-selected first; also detaches a still-connected owner when firing, since re-selecting a DISABLED actor while still mapped would stream CreateActor(isMe) twice
+  // Disable the body after the logout grace unless re-selected first; also detaches a still-connected owner when firing, since re-selecting a DISABLED actor while still mapped would stream CreateActor(isMe) twice
   private schedulePark(ctx: SystemContext, actorId: number): void {
     this.cancelPark(actorId);
     const handle = setTimeout(() => {
@@ -106,7 +149,7 @@ export class Spawn implements System {
         }
         this.log("Logout grace expired, actor", actorId.toString(16), "despawned");
       } catch { /* form vanished */ }
-    }, LOGOUT_GRACE_MS);
+    }, this.logoutGraceMs);
     this.parkTimers.set(actorId, handle);
   }
 
@@ -204,6 +247,33 @@ export class Spawn implements System {
     catch { return false; }
   }
 
+  // New actors are created with an empty inventory, so a wholesale set is safe.
+  // The kit is granted once per profile+slot: recreating a deleted character
+  // reuses the slot and gets clothes but no repeat gold faucet.
+  private giveStartingItems(mp: Mp, actorId: number, profileId: number, slot: number): void {
+    const key = `${profileId}:${slot}`;
+    const granted = this.loadStarterGrants();
+    const items = granted[key]
+      ? this.startingItems.filter(e => e.baseId !== 0x0000000f)
+      : this.startingItems;
+    try { mp.set(actorId, "inventory", { entries: items.map(e => ({ ...e })) }); }
+    catch { /* form vanished */ }
+    if (!granted[key]) {
+      granted[key] = true;
+      try { fs.writeFileSync(STARTER_GRANTS_FILE, JSON.stringify(granted)); }
+      catch (e) { this.log(`[spawn] starter-grants write failed: ${e}`); }
+    }
+  }
+
+  private loadStarterGrants(): Record<string, boolean> {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(STARTER_GRANTS_FILE, "utf8"));
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
   private sendCharacterList(ctx: SystemContext, userId: number, profileId: number): void {
     const mp = ctx.svr as unknown as Mp;
     const characters = this.slotMap(ctx, profileId).map((actorId, i) =>
@@ -237,6 +307,7 @@ export class Spawn implements System {
       actorId = ctx.svr.createActor(0, startPoints[idx].pos, startPoints[idx].angleZ,
         +startPoints[idx].worldOrCell, auth.profileId);
       mp.set(actorId, "private.charSlot", slot);
+      this.giveStartingItems(mp, actorId, auth.profileId, slot);
       this.log("Creating character", actorId.toString(16), "in slot", slot);
     } else {
       this.log("Loading character", actorId.toString(16), "from slot", slot);
@@ -300,6 +371,7 @@ export class Spawn implements System {
       const idx = randomInteger(0, startPoints.length - 1);
       actorId = ctx.svr.createActor(0, startPoints[idx].pos, startPoints[idx].angleZ,
         +startPoints[idx].worldOrCell, userProfileId);
+      this.giveStartingItems(mp, actorId, userProfileId, 0);
       this.log("Creating character", actorId.toString(16));
       ctx.svr.setUserActor(userId, actorId);
       ctx.svr.setRaceMenuOpen(actorId, true);

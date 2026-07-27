@@ -80,33 +80,51 @@ function get7za() {
 // Download / install MO2
 
 /** Download url to dest, following redirects (GitHub releases redirect to a CDN). */
+// Every outcome settles the promise exactly once: an aborted response used to fire
+// no handler at all, leaving the install awaiting this forever until app restart.
 function downloadFile(url, dest, onProgress, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
+    let file = null
+    let settled = false
+    const finish = val => { if (!settled) { settled = true; resolve(val) } }
+    // Destroy the stream before unlinking: an open handle leaves the partial file delete-pending on Windows and blocks every retry this session.
+    const fail = err => {
+      if (settled) return
+      settled = true
+      if (file && !file.destroyed) {
+        file.once('close', () => { try { fs.unlinkSync(dest) } catch {} reject(err) })
+        file.destroy()
+      } else {
+        try { fs.unlinkSync(dest) } catch {}
+        reject(err)
+      }
+    }
     const req = https.get(url, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume()
-        if (redirectsLeft <= 0) return reject(new Error('Too many redirects'))
-        return resolve(downloadFile(res.headers.location, dest, onProgress, redirectsLeft - 1))
+        if (redirectsLeft <= 0) return fail(new Error('Too many redirects'))
+        return finish(downloadFile(res.headers.location, dest, onProgress, redirectsLeft - 1))
       }
       if (res.statusCode !== 200) {
         res.resume()
-        return reject(new Error(`HTTP ${res.statusCode} downloading ${url}`))
+        return fail(new Error(`HTTP ${res.statusCode} downloading ${url}`))
       }
 
       const total = parseInt(res.headers['content-length'] || '0', 10)
       let received = 0
-      const file = fs.createWriteStream(dest)
+      file = fs.createWriteStream(dest)
       res.on('data', chunk => {
         received += chunk.length
         if (onProgress) onProgress(received, total)
       })
       res.pipe(file)
-      file.on('finish', () => file.close(resolve))
-      file.on('error', err => { try { fs.unlinkSync(dest) } catch {} reject(err) })
-      res.on('error',  err => { try { fs.unlinkSync(dest) } catch {} reject(err) })
+      file.on('finish', () => file.close(() => finish(dest)))
+      file.on('error', fail)
+      res.on('error',  fail)
+      res.on('aborted', () => fail(new Error('Download interrupted')))
     })
-    req.on('error', reject)
-    req.setTimeout(120_000, () => { req.destroy(); reject(new Error('Download timed out')) })
+    req.on('error', fail)
+    req.setTimeout(120_000, () => { req.destroy(); fail(new Error('Download timed out')) })
   })
 }
 
@@ -178,6 +196,19 @@ function instanceDirLines() {
   ]
 }
 
+// The custom-executable entry (array slot n) that moshortcut://:SKSE resolves against.
+function skseExecutableLines(skyrimPath, n) {
+  return [
+    `${n}\\title=SKSE`,
+    `${n}\\binary=${fwd(path.join(skyrimPath, 'skse64_loader.exe'))}`,
+    `${n}\\workingDirectory=${fwd(skyrimPath)}`,
+    `${n}\\arguments=`,
+    `${n}\\hide=false`,
+    `${n}\\toolbar=true`,
+    `${n}\\ownicon=true`,
+  ]
+}
+
 // Full portable-instance ini, written once when the instance is first created.
 function buildInstanceIni(skyrimPath, style) {
   return [
@@ -196,15 +227,33 @@ function buildInstanceIni(skyrimPath, style) {
     '',
     '[customExecutables]',
     'size=1',
-    '1\\title=SKSE',
-    `1\\binary=${fwd(path.join(skyrimPath, 'skse64_loader.exe'))}`,
-    `1\\workingDirectory=${fwd(skyrimPath)}`,
-    '1\\arguments=',
-    '1\\hide=false',
-    '1\\toolbar=true',
-    '1\\ownicon=true',
+    ...skseExecutableLines(skyrimPath, 1),
     '',
   ].join('\r\n')
+}
+
+// Reinstate a lost SKSE shortcut entry; MO2 cannot resolve moshortcut://:SKSE without it.
+function ensureSkseEntry(txt, skyrimPath) {
+  const lines = txt.split(/\r?\n/)
+  const start = lines.findIndex(l => l.trim() === '[customExecutables]')
+  if (start === -1) {
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop()
+    return lines.concat(['', '[customExecutables]', 'size=1', ...skseExecutableLines(skyrimPath, 1), '']).join('\r\n')
+  }
+  let end = start + 1
+  while (end < lines.length && !/^\[/.test(lines[end].trim())) end++
+  // Append as the next array slot, bumping (or adding) the section's size counter.
+  let n = 1
+  for (let i = start + 1; i < end; i++) {
+    const m = lines[i].match(/^size=(\d+)/)
+    if (m) { n = parseInt(m[1], 10) + 1; lines[i] = `size=${n}`; break }
+  }
+  const insert = skseExecutableLines(skyrimPath, n)
+  if (n === 1) insert.unshift('size=1')
+  let at = end
+  while (at > start + 1 && lines[at - 1].trim() === '') at--
+  lines.splice(at, 0, ...insert)
+  return lines.join('\r\n')
 }
 
 // Update ini path
@@ -213,9 +262,16 @@ function healInstancePaths(iniPath, skyrimPath) {
   const ssePath  = fwd(path.join(skyrimPath, 'skse64_loader.exe'))
   let txt = fs.readFileSync(iniPath, 'utf8')
   // Function replacers avoid '$' in paths being treated as replacement tokens.
-  txt = txt.replace(/^gamePath=.*$/m,            () => `gamePath=@ByteArray(${gamePath})`)
-  txt = txt.replace(/^1\\binary=.*$/m,           () => `1\\binary=${ssePath}`)
-  txt = txt.replace(/^1\\workingDirectory=.*$/m, () => `1\\workingDirectory=${gamePath}`)
+  txt = txt.replace(/^gamePath=.*$/m, () => `gamePath=@ByteArray(${gamePath})`)
+
+  // Heal the SKSE entry by its title (MO2 may reorder the array on save), or reinstate it when lost.
+  const skseIdx = (txt.match(/^(\d+)\\title=SKSE\s*$/m) || [])[1]
+  if (skseIdx) {
+    txt = txt.replace(new RegExp(`^${skseIdx}\\\\binary=.*$`, 'm'),           () => `${skseIdx}\\binary=${ssePath}`)
+    txt = txt.replace(new RegExp(`^${skseIdx}\\\\workingDirectory=.*$`, 'm'), () => `${skseIdx}\\workingDirectory=${gamePath}`)
+  } else {
+    txt = ensureSkseEntry(txt, skyrimPath)
+  }
 
   // Upsert each directory pin: replace an existing key or append under [Settings].
   for (const line of instanceDirLines()) {
@@ -374,7 +430,15 @@ async function downloadToDownloads(url, fileName, onProgress) {
   if (fs.existsSync(dest)) return fileName
   fs.mkdirSync(getDownloadsDir(), { recursive: true })
   const temp = dest + '.unfinished'
-  await downloadFile(url, temp, onProgress)
+  try { fs.rmSync(temp, { force: true }) } catch {}   // stale partial from an earlier failed run
+  try {
+    await downloadFile(url, temp, onProgress)
+  } catch (err) {
+    // One retry: SKSE and mod hosts drop connections often enough that a single blip should not fail the whole install pass.
+    _log(`download failed (${err.message}), retrying: ${url}`)
+    await new Promise(r => setTimeout(r, 3000))
+    await downloadFile(url, temp, onProgress)
+  }
   fs.renameSync(temp, dest)
   return fileName
 }
@@ -911,8 +975,13 @@ function disableCcContent(gamePath, serverLoadOrder) {
 // Launch
 
 /** Launch the game through MO2's VFS using the SKSE executable entry. */
-function launchGame() {
+function launchGame(skyrimPath) {
   if (!isInstalled()) throw new Error('MO2 is not installed - run setup in Settings first.')
+  // moshortcut://:SKSE only resolves against the ini's SKSE entry, so verify it and self-heal before spawning.
+  const iniPath = path.join(getRoot(), 'ModOrganizer.ini')
+  const hasShortcut = () => { try { return /^\d+\\title=SKSE\s*$/m.test(fs.readFileSync(iniPath, 'utf8')) } catch { return false } }
+  if (!hasShortcut() && skyrimPath) ensureInstance(skyrimPath)
+  if (!hasShortcut()) throw new Error('The MO2 SKSE shortcut is missing from ModOrganizer.ini - run Install Modlist to repair it.')
   spawn(getExe(), ['-p', PROFILE, 'moshortcut://:SKSE'], {
     detached: true,
     stdio: 'ignore',

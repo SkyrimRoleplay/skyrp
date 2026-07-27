@@ -49,20 +49,21 @@ const DEFAULT_MANACLES = 0;
 const CARRY_FOLLOW_INTERVAL_MS = 120;
 const CARRY_FOLLOW_MIN_MOVE_SQ = 16 * 16;
 
-// A consent prompt lapses if the target doesn't answer in time.
-const CONSENT_TIMEOUT_MS = 20000;
+// A consent prompt lapses if the target doesn't answer in time. Overridable via "captureConsentTimeoutMs".
+const DEFAULT_CONSENT_TIMEOUT_MS = 20000;
 
-// The same (captor, target) pair may only be prompted this often.
-const CONSENT_COOLDOWN_MS = 15000;
+// The same (captor, target) pair may only be prompted this often. Overridable via "captureConsentCooldownMs".
+const DEFAULT_CONSENT_COOLDOWN_MS = 15000;
 
-// Server-side backstop for the client's "look at a player" rule: max capture/carry initiation range in game units (~activate range)
-const INTERACT_MAX_DISTANCE = 256;
+// Server-side backstop for the client's "look at a player" rule: max capture/carry initiation range in game units (~activate range). Overridable via "captureInteractMaxDistance".
+const DEFAULT_INTERACT_MAX_DISTANCE = 256;
 
 interface RestraintInfo {
   boundHands: boolean;   // arrested
   carried: boolean;
   captorActorId: number; // who applied it: release authority + disconnect cleanup
   offlineCarrierActorId?: number; // who was carrying them when they logged out
+  addedShackle?: boolean; // a pair was moved captor -> captive, remove it on release
 }
 
 interface PendingConsent {
@@ -92,6 +93,9 @@ export class CaptureSystem implements System {
   private manaclesFormId = DEFAULT_MANACLES;
   private captiveAnim = "OffsetBoundStandingStart";
   private carrierAnim = "OffsetCarryBasketStart";
+  private interactMaxDistance = DEFAULT_INTERACT_MAX_DISTANCE;
+  private consentTimeoutMs = DEFAULT_CONSENT_TIMEOUT_MS;
+  private consentCooldownMs = DEFAULT_CONSENT_COOLDOWN_MS;
 
   // targetActorId -> restraint state
   private restraints = new Map<number, RestraintInfo>();
@@ -112,8 +116,10 @@ export class CaptureSystem implements System {
     const s = await Settings.get();
     this.manaclesFormId = toFormId(s.manaclesFormId, DEFAULT_MANACLES);
     // Fail closed: a set-but-unparseable manaclesFormId must not disable the
-    // item requirement, so pin it to a form nobody can hold.
-    if (s.manaclesFormId && this.manaclesFormId === 0) {
+    // item requirement, so pin it to a form nobody can hold. An explicit "0"
+    // or "0x0" is a legitimate disable, not a parse failure.
+    const rawManacles = String(s.manaclesFormId ?? "").trim();
+    if (rawManacles && rawManacles !== "0" && rawManacles !== "0x0" && this.manaclesFormId === 0) {
       this.manaclesFormId = 0xffffffff;
       this.log(`[capture] ERROR: manaclesFormId "${s.manaclesFormId}" is not a valid form id — arrests disabled until fixed`);
     }
@@ -123,6 +129,13 @@ export class CaptureSystem implements System {
     if (typeof s.carrierAnimEvent === "string" && s.carrierAnimEvent) {
       this.carrierAnim = s.carrierAnimEvent;
     }
+    const all = s.allSettings as Record<string, unknown> | null;
+    const rawDist = Number(all?.["captureInteractMaxDistance"]);
+    if (Number.isFinite(rawDist) && rawDist > 0) this.interactMaxDistance = rawDist;
+    const rawTimeout = Number(all?.["captureConsentTimeoutMs"]);
+    if (Number.isInteger(rawTimeout) && rawTimeout > 0) this.consentTimeoutMs = rawTimeout;
+    const rawCooldown = Number(all?.["captureConsentCooldownMs"]);
+    if (Number.isInteger(rawCooldown) && rawCooldown >= 0) this.consentCooldownMs = rawCooldown;
     if (this.manaclesFormId === 0) {
       this.log(`[capture] manaclesFormId not configured — arrests need no item`);
     } else {
@@ -248,6 +261,9 @@ export class CaptureSystem implements System {
     }
     this.mirrorState(ctx, actorId);
     this.sendRestraint(ctx, actorId, info);
+    if (info.boundHands) {
+      this.equipShackles(ctx, actorId); // relog must not shed the cuffs
+    }
   }
 
   // ── Incoming requests ──────────────────────────────────────────────────────
@@ -411,14 +427,14 @@ export class CaptureSystem implements System {
     const now = Date.now();
     const cooldownKey = `${captorActorId}:${targetActorId}`;
     const lastPrompt = this.consentCooldown.get(cooldownKey);
-    if (lastPrompt !== undefined && now - lastPrompt < CONSENT_COOLDOWN_MS) {
+    if (lastPrompt !== undefined && now - lastPrompt < this.consentCooldownMs) {
       this.notice(ctx, this.userOf(ctx, captorActorId),
         `Wait before asking ${this.nameOf(ctx, targetActorId)} again.`);
       return;
     }
     if (this.consentCooldown.size > 512) {
       for (const [k, t] of Array.from(this.consentCooldown)) {
-        if (now - t >= CONSENT_COOLDOWN_MS) {
+        if (now - t >= this.consentCooldownMs) {
           this.consentCooldown.delete(k);
         }
       }
@@ -431,7 +447,7 @@ export class CaptureSystem implements System {
         this.notice(ctx, this.userOf(ctx, captorActorId),
           `${this.nameOf(ctx, targetActorId)} did not respond.`);
       }
-    }, CONSENT_TIMEOUT_MS);
+    }, this.consentTimeoutMs);
     this.pending.set(requestId, { kind, captorActorId, targetActorId, timer });
 
     const captorName = this.nameOf(ctx, captorActorId) || "Someone";
@@ -469,6 +485,9 @@ export class CaptureSystem implements System {
     this.restraints.set(targetActorId, info);
     this.mirrorState(ctx, targetActorId);
     this.sendRestraint(ctx, targetActorId, info);
+    if (this.equipShackles(ctx, targetActorId, captorActorId)) {
+      info.addedShackle = true;
+    }
     this.log(`[capture] ${targetActorId.toString(16)} bound by ${captorActorId.toString(16)}`);
   }
 
@@ -519,9 +538,13 @@ export class CaptureSystem implements System {
       this.lastCarryPos.delete(targetActorId);
       this.sendCarryState(ctx, carrier, false);
     }
+    const info = this.restraints.get(targetActorId);
     this.restraints.delete(targetActorId);
     this.mirrorState(ctx, targetActorId);
     this.sendRestraint(ctx, targetActorId, { boundHands: false, carried: false, captorActorId: 0 });
+    if (info?.boundHands === true) {
+      this.removeShackles(ctx, targetActorId, info.addedShackle === true);
+    }
   }
 
   // ── Packet senders ─────────────────────────────────────────────────────────
@@ -575,7 +598,7 @@ export class CaptureSystem implements System {
     return this.nearEnough(ctx, selfActorId, targetActorId);
   }
 
-  // Same cell/worldspace and within INTERACT_MAX_DISTANCE; the target id is client-supplied, so this stops a modified client grabbing players across the map
+  // Same cell/worldspace and within interactMaxDistance; the target id is client-supplied, so this stops a modified client grabbing players across the map
   private nearEnough(ctx: SystemContext, selfActorId: number, targetActorId: number): boolean {
     try {
       if (ctx.svr.getActorCellOrWorld(selfActorId) !==
@@ -585,7 +608,7 @@ export class CaptureSystem implements System {
       const a = ctx.svr.getActorPos(selfActorId);
       const b = ctx.svr.getActorPos(targetActorId);
       const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-      return dx * dx + dy * dy + dz * dz <= INTERACT_MAX_DISTANCE * INTERACT_MAX_DISTANCE;
+      return dx * dx + dy * dy + dz * dz <= this.interactMaxDistance * this.interactMaxDistance;
     } catch {
       return false;
     }
@@ -596,6 +619,85 @@ export class CaptureSystem implements System {
       return mp.get(actorId, "private.permaDead") === true;
     } catch {
       return false;
+    }
+  }
+
+  private countShackles(mp: Mp, actorId: number): number {
+    try {
+      const inv = mp.get(actorId, "inventory");
+      const entries: any[] = inv && Array.isArray(inv.entries) ? inv.entries : [];
+      return entries.reduce((n, e) => (e.baseId >>> 0) === this.manaclesFormId ? n + (e.count | 0) : n, 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  // Adjust an actor's cuff count by +-1 via the inventory property.
+  private moveShackle(mp: Mp, actorId: number, delta: number): boolean {
+    try {
+      const inv = mp.get(actorId, "inventory");
+      const entries: any[] = (inv && Array.isArray(inv.entries) ? inv.entries : []).map((e: any) => ({ ...e }));
+      const stack = entries.find((e) => (e.baseId >>> 0) === this.manaclesFormId && !e.worn && !e.wornLeft);
+      if (delta > 0) {
+        if (stack) { stack.count += delta; } else { entries.push({ baseId: this.manaclesFormId, count: delta }); }
+      } else {
+        const any = entries.find((e) => (e.baseId >>> 0) === this.manaclesFormId && e.count > 0);
+        if (!any) { return false; }
+        any.count += delta;
+      }
+      mp.set(actorId, "inventory", { entries: entries.filter((e) => e.count > 0) });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // The captive wears a pair of the manacles item. On the initial capture one
+  // pair is MOVED from the captor so cuffs are conserved, never minted; a
+  // re-apply after relog only re-equips. Returns true when a pair was moved.
+  private equipShackles(ctx: SystemContext, targetActorId: number, captorActorId?: number): boolean {
+    if (this.manaclesFormId === 0 || this.manaclesFormId === 0xffffffff) {
+      return false;
+    }
+    const mp = ctx.svr as Mp;
+    let transferred = false;
+    if (captorActorId && this.countShackles(mp, targetActorId) === 0) {
+      if (this.moveShackle(mp, captorActorId, -1)) {
+        this.moveShackle(mp, targetActorId, +1);
+        transferred = true;
+      }
+    }
+    if (this.countShackles(mp, targetActorId) === 0) {
+      return transferred; // nothing to equip and EquipItem must not mint one
+    }
+    try {
+      const self = { type: "form", desc: mp.getDescFromId(targetActorId) };
+      const item = { type: "espm", desc: mp.getDescFromId(this.manaclesFormId) };
+      // EquipItem(akItem, abPreventRemoval, abSilent)
+      mp.callPapyrusFunction("method", "Actor", "EquipItem", self, [item, true, true]);
+    } catch (e) {
+      this.log(`[capture] equip shackles failed: ${e}`);
+    }
+    return transferred;
+  }
+
+  // Unequip always; destroy exactly the one transferred pair (a captive's own
+  // pre-owned cuffs are never touched).
+  private removeShackles(ctx: SystemContext, targetActorId: number, removeOne: boolean): void {
+    if (this.manaclesFormId === 0 || this.manaclesFormId === 0xffffffff) {
+      return;
+    }
+    const mp = ctx.svr as Mp;
+    try {
+      const self = { type: "form", desc: mp.getDescFromId(targetActorId) };
+      const item = { type: "espm", desc: mp.getDescFromId(this.manaclesFormId) };
+      // UnequipItem(akItem, abPreventEquip, abSilent)
+      mp.callPapyrusFunction("method", "Actor", "UnequipItem", self, [item, false, true]);
+    } catch (e) {
+      this.log(`[capture] unequip shackles failed: ${e}`);
+    }
+    if (removeOne) {
+      this.moveShackle(mp, targetActorId, -1);
     }
   }
 

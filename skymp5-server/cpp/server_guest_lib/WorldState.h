@@ -229,6 +229,9 @@ public:
   void SetNpcSettings(
     std::unordered_map<std::string, NpcSettingsEntry>&& settings);
   void SetForbiddenRelootTypes(const std::set<std::string>& types);
+  void SetBlockedSpells(const std::set<uint32_t>& spells);
+  // Callable from ActionListener (not a friend), so it lives in this public section
+  [[nodiscard]] bool IsSpellBlocked(uint32_t spellId) const noexcept;
   void SetEnableConsoleCommandsForAllSetting(bool enable);
 
 public:

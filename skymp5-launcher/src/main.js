@@ -11,7 +11,7 @@ const os     = require('os')
 const crypto = require('crypto')
 const http   = require('http')
 const https  = require('https')
-const { spawn } = require('child_process')
+const { spawn, execFileSync } = require('child_process')
 const Store  = require('electron-store')
 const AdmZip = require('adm-zip')
 const config = require('./config')
@@ -58,7 +58,10 @@ const store = new Store({
   }
 })
 
-mo2.setRootProvider(() => store.get('baseDirPath') || null)
+mo2.setRootProvider(() => store.get('baseDirPath') || DEFAULT_BASE_DIR)
+
+// Default install root for MO2 + the portable game copy when none is stored.
+const DEFAULT_BASE_DIR = 'C:\\SkyRP'
 
 let win = null
 
@@ -109,6 +112,75 @@ function effectiveGamePath() {
   return store.get('skyrimPath')
 }
 
+// Skyrim path auto-detection
+// Registry keys the store editions write at install time, probed in order.
+const SKYRIM_REGISTRY_PROBES = [
+  { key: 'HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games\\1801825368', value: 'path' },   // Skyrim AE GOG
+  { key: 'HKLM\\SOFTWARE\\WOW6432Node\\GOG.com\\Games\\1711237643', value: 'path' },   // Skyrim SE GOG
+  { key: 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 489830', value: 'InstallLocation' },  // Steam
+  { key: 'HKLM\\SOFTWARE\\WOW6432Node\\Bethesda Softworks\\Skyrim Special Edition', value: 'installed path' },
+]
+
+// Read a single registry value via reg.exe (argv array, same pattern as mo2.js).
+function regQueryValue(key, value) {
+  try {
+    const out = execFileSync('reg', ['query', key, '/v', value],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true })
+    const m = out.match(/REG_(?:EXPAND_)?SZ\s+(.+)/)
+    return m ? m[1].trim() : null
+  } catch { return null }   // key or value missing
+}
+
+function isValidSkyrimPath(p) {
+  return !!p && fs.existsSync(path.join(p, 'SkyrimSE.exe'))
+}
+
+// Stable per-machine id (Windows MachineGuid) reported to the backend for the
+// ban system; null when unavailable, the backend treats it as optional.
+function getHwid() {
+  if (process.platform !== 'win32') return null
+  const guid = regQueryValue('HKLM\\SOFTWARE\\Microsoft\\Cryptography', 'MachineGuid')
+  return guid && /^[0-9a-fA-F-]{10,64}$/.test(guid) ? guid : null
+}
+
+// Fire-and-forget: attach this machine's hwid to the fresh play session.
+async function reportHwid(token) {
+  const hwid = getHwid()
+  if (!hwid || !token) return
+  try {
+    await postJSON(`${config.apiUrl}/api/users/me/hwid`, { hwid }, { Authorization: `Bearer ${token}` })
+  } catch (err) {
+    log(`[hwid] report failed (${err.statusCode || err.message}) - continuing without it`)
+  }
+}
+
+// First registry hit that exists on disk and contains SkyrimSE.exe, or null.
+function detectSkyrimPath() {
+  if (process.platform !== 'win32') return null
+  for (const probe of SKYRIM_REGISTRY_PROBES) {
+    const p = regQueryValue(probe.key, probe.value)
+    if (isValidSkyrimPath(p)) return p
+  }
+  return null
+}
+
+// When the stored path is empty or invalid, auto-fill it from the registry and persist.
+function ensureSkyrimPath() {
+  const stored = store.get('skyrimPath')
+  if (isValidSkyrimPath(stored)) return stored
+  const detected = detectSkyrimPath()
+  if (detected) {
+    store.set('skyrimPath', detected)
+    log(`[detect] Skyrim path auto-detected: ${detected}`)
+  }
+  return detected
+}
+
+ipcMain.handle('game:detectPath', () => {
+  // Fill-only: the renderer shows the result and Save persists it
+  return { path: detectSkyrimPath() }
+})
+
 // Window
 function createWindow() {
   win = new BrowserWindow({
@@ -134,6 +206,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  ensureSkyrimPath()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -163,12 +236,17 @@ ipcMain.handle('settings:load', async () => {
     }
   } catch { /* keep existing cache */ }
 
+  // Auto-fill an empty/invalid Skyrim path from the registry (renderer calls
+  // this at startup and whenever the settings modal opens).
+  ensureSkyrimPath()
+
   const servers = store.get('cachedServers') || []
   // Whitelist only what the renderer reads. Never spread the whole store: it
   // holds secrets (nexusApiKey, nexusOauth tokens, gameSession, gameProfileId)
   // the renderer must never receive.
   return {
     skyrimPath:        store.get('skyrimPath'),
+    baseDirPath:       store.get('baseDirPath') || DEFAULT_BASE_DIR,
     activeServerIndex: store.get('activeServerIndex'),
     mo2Enabled:        store.get('mo2Enabled'),
     isolatedGame:      store.get('isolatedGame'),
@@ -178,7 +256,7 @@ ipcMain.handle('settings:load', async () => {
   }
 })
 ipcMain.handle('settings:save', (_e, data) => {
-  const allowed = ['skyrimPath', 'activeServerIndex', 'mo2Enabled', 'isolatedGame']
+  const allowed = ['skyrimPath', 'baseDirPath', 'activeServerIndex', 'mo2Enabled', 'isolatedGame']
   const clean = {}
   for (const k of allowed) if (k in data) clean[k] = data[k]
   store.set(clean)
@@ -363,13 +441,47 @@ function applyForcedServerDefaults(gamePath) {
   } catch (err) {
     log('[defaults] could not write controlmap override:', err.message)
   }
+
+  // AE popup suppression, re-applied on every install pass so existing installs pick it up.
+  try {
+    // Portable copies only: never blank the ccc of a player's real install.
+    if (gamePath && store.get('isolatedGame') && gamePath === isolatedGameDir()) {
+      const ccc = path.join(gamePath, 'Skyrim.ccc')
+      if (!fs.existsSync(ccc) || fs.statSync(ccc).size > 0) {
+        fs.writeFileSync(ccc, '')
+        log('[defaults] wrote empty Skyrim.ccc (no CC content expected)')
+      }
+    }
+  } catch (err) {
+    log('[defaults] could not write Skyrim.ccc:', err.message)
+  }
+  // Profile ini: kill the Bethesda.net platform, which drives the "AE content available for download" prompt and the CC news.
+  try {
+    const dest = path.join(mo2.getProfileDir(), 'skyrim.ini')
+    if (!fs.existsSync(dest)) {
+      // Seed from the player's own ini first so a minimal profile ini never hides their settings (language, archives, etc).
+      const prefs = findOriginalPrefsIni()
+      const src = prefs ? path.join(path.dirname(prefs), 'Skyrim.ini') : null
+      if (src && fs.existsSync(src)) {
+        fs.mkdirSync(path.dirname(dest), { recursive: true })
+        fs.copyFileSync(src, dest)
+      }
+    }
+    const cur = ini.read(dest)['Bethesda.net'] || {}
+    if (String(cur['bEnablePlatform'] || '') !== '0') {
+      ini.write(dest, { 'Bethesda.net': { bEnablePlatform: '0' } })
+      log('[defaults] disabled the Bethesda.net platform in the profile Skyrim.ini')
+    }
+  } catch (err) {
+    log('[defaults] could not write the profile Skyrim.ini:', err.message)
+  }
 }
 
 // Folder picker
-ipcMain.handle('dialog:openFolder', async () => {
+ipcMain.handle('dialog:openFolder', async (_e, title) => {
   const result = await dialog.showOpenDialog(win, {
-    properties: ['openDirectory'],
-    title: 'Select Skyrim Installation Folder',
+    properties: ['openDirectory', 'createDirectory'],
+    title: typeof title === 'string' && title ? title : 'Select Skyrim Installation Folder',
   })
   return result.canceled ? null : result.filePaths[0]
 })
@@ -493,6 +605,8 @@ ipcMain.handle('discord:login', async () => {
     store.set('gameSession',   token)
     log(`[discord] logged in as ${discordUser.username} (profileId ${masterApiId})`)
 
+    reportHwid(token) // not awaited: login must not block on the ban-system hwid
+
     return { success: true, user: discordUser }
   }
 
@@ -612,7 +726,19 @@ function pathsOverlap(a, b) {
   return na.startsWith(nb) || nb.startsWith(na)
 }
 
-ipcMain.handle('game:createIsolated', async () => {
+ipcMain.handle('game:createIsolated', async (_e, baseDirOverride) => {
+  if (installing) {
+    return { success: false, error: 'An install is already running - wait for it to finish.' }
+  }
+  installing = true
+  try {
+    return await createIsolatedImpl(baseDirOverride)
+  } finally {
+    installing = false
+  }
+})
+
+async function createIsolatedImpl(baseDirOverride) {
   const src = store.get('skyrimPath')
   if (!src || !fs.existsSync(path.join(src, 'SkyrimSE.exe'))) {
     return { success: false, error: 'Set a valid Skyrim path first (SkyrimSE.exe not found).' }
@@ -624,19 +750,13 @@ ipcMain.handle('game:createIsolated', async () => {
 
   // No clean-install check needed: copyGameDir copies only vanilla files, so a modded source is fine.
 
-  // Ask where to install the modlist.
-  const picked = await dialog.showOpenDialog(win, {
-    title:       'Choose where to install SkyRP (~16 GB: MO2 + game copy)',
-    buttonLabel: 'Install here',
-    properties:  ['openDirectory', 'createDirectory'],
-  })
-  if (picked.canceled || !picked.filePaths[0]) {
-    return { success: false, canceled: true, error: 'Installation cancelled.' }
-  }
+  // Install target: the Install Location field, else the stored/default base dir.
+  let base = (typeof baseDirOverride === 'string' && baseDirOverride.trim()) ||
+             store.get('baseDirPath') || DEFAULT_BASE_DIR
 
-  // Portable instance fix
-  let base = picked.filePaths[0]
-  if (!fs.existsSync(path.join(base, 'skyrp-instance.txt'))) {
+  // Portable instance fix: nest a generic folder under \SkyRP
+  if (path.basename(base).toLowerCase() !== 'skyrp' &&
+      !fs.existsSync(path.join(base, 'skyrp-instance.txt'))) {
     base = path.join(base, 'SkyRP')
   }
 
@@ -694,13 +814,16 @@ ipcMain.handle('game:createIsolated', async () => {
   } catch (err) {
     return { success: false, error: err.message }
   }
-})
+}
 
 // Vanilla root files, by store edition. Only those present get copied.
 // Skyrim.ccc is deliberately NOT copied: no cc* plugins are copied either, and
 // an orphan ccc list makes the engine treat the AE/CC content set as changed,
 // which pops the Creation Club announcement over the main menu on first boot.
 // That box is modal and SkyrimPlatform cannot dismiss pre-game menus.
+// copyGameDir instead writes an EMPTY Skyrim.ccc (engine expects no CC content)
+// and applyForcedServerDefaults keeps it empty plus disables the Bethesda.net
+// platform, so AE owners never get the "download AE content" prompt either.
 const VANILLA_ROOT_FILES = [
   'SkyrimSE.exe', 'SkyrimSELauncher.exe', 'bink2w64.dll',
   'steam_api64.dll', 'Galaxy64.dll', 'EOSSDK-Win64-Shipping.dll',
@@ -779,6 +902,8 @@ async function copyGameDir(src, dst) {
     copied++
     send('isolated:progress', `Copying vanilla game files… ${copied}/${jobs.length} (${job.rel})`)
   }
+  // AE popup fix: an empty Skyrim.ccc declares no CC content expected, so the engine never prompts AE owners to download it.
+  try { fs.writeFileSync(path.join(dst, 'Skyrim.ccc'), '') } catch { /* re-applied by applyForcedServerDefaults */ }
   // Completion marker: file presence alone cannot prove the copy finished
   // (the esms sort after the BSAs, so partial copies look deceptively full).
   try {
@@ -986,28 +1111,45 @@ function assertSecureDownloadUrl(url) {
 }
 
 // Download a URL to a local file, following redirects (release URLs hit a CDN).
+// Settles exactly once on every outcome (an aborted response used to hang forever).
 function downloadToFile(url, dest, onProgress, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
     try { assertSecureDownloadUrl(url) } catch (err) { return reject(err) }
+    let file = null
+    let settled = false
+    const finish = val => { if (!settled) { settled = true; resolve(val) } }
+    // Destroy the stream before unlinking: an open handle leaves the partial file delete-pending on Windows and blocks every retry this session.
+    const fail = err => {
+      if (settled) return
+      settled = true
+      if (file && !file.destroyed) {
+        file.once('close', () => { try { fs.unlinkSync(dest) } catch {} reject(err) })
+        file.destroy()
+      } else {
+        try { fs.unlinkSync(dest) } catch {}
+        reject(err)
+      }
+    }
     const mod = url.startsWith('https') ? https : http
     const req = mod.get(url, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume()
-        if (redirectsLeft <= 0) return reject(new Error('Too many redirects'))
-        return resolve(downloadToFile(res.headers.location, dest, onProgress, redirectsLeft - 1))
+        if (redirectsLeft <= 0) return fail(new Error('Too many redirects'))
+        return finish(downloadToFile(res.headers.location, dest, onProgress, redirectsLeft - 1))
       }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)) }
+      if (res.statusCode !== 200) { res.resume(); return fail(new Error(`HTTP ${res.statusCode}`)) }
       const total = parseInt(res.headers['content-length'] || '0', 10)
       let received = 0
-      const file = fs.createWriteStream(dest)
+      file = fs.createWriteStream(dest)
       res.on('data', c => { received += c.length; if (onProgress) onProgress(received, total) })
       res.pipe(file)
-      file.on('finish', () => file.close(() => resolve(dest)))
-      file.on('error', err => { try { fs.unlinkSync(dest) } catch {} reject(err) })
-      res.on('error',  err => { try { fs.unlinkSync(dest) } catch {} reject(err) })
+      file.on('finish', () => file.close(() => finish(dest)))
+      file.on('error', fail)
+      res.on('error',  fail)
+      res.on('aborted', () => fail(new Error('Download interrupted')))
     })
-    req.on('error', reject)
-    req.setTimeout(120_000, () => { req.destroy(); reject(new Error('Download timed out')) })
+    req.on('error', fail)
+    req.setTimeout(120_000, () => { req.destroy(); fail(new Error('Download timed out')) })
   })
 }
 
@@ -1077,7 +1219,7 @@ ipcMain.handle('launch:skse', async () => {
   try {
     if (mo2Enabled) {
       // MO2 manages plugins.txt itself via the profile; launch through its VFS.
-      mo2.launchGame()
+      mo2.launchGame(skyrimPath)
     } else {
       // Direct launch (manual mod installs): run SKSE in active game dir
       const exe = path.join(skyrimPath, 'skse64_loader.exe')
@@ -1096,10 +1238,10 @@ ipcMain.handle('launch:skse', async () => {
 ipcMain.handle('launch:viaMO2', async () => {
   const skyrimPath = effectiveGamePath()
   if (!skyrimPath) return { success: false, error: 'Skyrim path not configured.' }
-  if (!mo2.isInstalled()) return { success: false, error: 'MO2 is not installed - run Install Modpack first.' }
+  if (!mo2.isInstalled()) return { success: false, error: 'MO2 is not installed - use Install MO2 first.' }
   const prep = await prepareForLaunch(skyrimPath, true)
   if (!prep.success) return prep
-  try { mo2.launchGame(); return { success: true } }
+  try { mo2.launchGame(skyrimPath); return { success: true } }
   catch (err) { return { success: false, error: err.message } }
 })
 
@@ -1142,7 +1284,7 @@ function verifyLaunchReadiness(skyrimPath, viaMO2, serverInfo) {
   const missingFiles = REQUIRED_FILES.filter(f => !fs.existsSync(path.join(skyrimPath, f)))
   if (missingFiles.length > 0) {
     const names = missingFiles.map(f => path.basename(f)).join(', ')
-    const hint  = viaMO2 ? 'run "Install Modpack via MO2"' : 'run Install'
+    const hint  = viaMO2 ? 'run Install Modlist in Settings' : 'run Install'
     problems.push(`Client files missing (${names}); ${hint} first.`)
   }
 
@@ -1172,7 +1314,7 @@ function verifyLaunchReadiness(skyrimPath, viaMO2, serverInfo) {
 
   // Fallback if install fails
   if (viaMO2 && store.get('modpackState') === 'failed') {
-    problems.push('The last modpack install did not finish. Press PLAY (it will show UPDATE) or run "Install Modpack" to complete it first.')
+    problems.push('The last modpack install did not finish. Press PLAY (it will show UPDATE) or run Install Modlist to complete it first.')
   }
 
   // Fallback for engine fixes failure (like with AV software)
@@ -1227,15 +1369,16 @@ async function prepareForLaunch(skyrimPath, viaMO2) {
 
   // Load order sync
   let loadOrderFixed = false
+  // Heal the instance ini (paths + SKSE shortcut) before every MO2 launch, even when serverinfo is unavailable.
+  if (viaMO2) mo2.ensureInstance(skyrimPath, serverInfo?.loadOrder)
   if (Array.isArray(serverInfo?.loadOrder) && serverInfo.loadOrder.length > 0) {
     if (viaMO2) {
-      mo2.ensureInstance(skyrimPath, serverInfo.loadOrder)
       const missing = missingPluginsForMO2(skyrimPath, serverInfo.loadOrder)
       if (missing.length > 0) {
         return {
           success: false,
           error: `Missing required plugins: ${missing.join(', ')}. ` +
-                 `Run "Install Modpack" in Settings → Mod Manager first.`,
+                 `Run Install Modlist in Settings first.`,
         }
       }
       loadOrderFixed = true
@@ -1282,7 +1425,7 @@ async function prepareForLaunch(skyrimPath, viaMO2) {
         if (check.filesOk === false) {
           return { success: false, error: 'Your client files are out of date. Press the button again to update, then launch.' }
         }
-        return { success: false, error: 'Your plugin load order does not match the server. Run "Install Modpack" in Settings → Mod Manager.' }
+        return { success: false, error: 'Your plugin load order does not match the server. Run Install Modlist in Settings.' }
       }
       log('[launch] launch-check passed')
     } catch (err) {
@@ -1393,6 +1536,8 @@ ipcMain.on('install:start', (_e, mode) => {
     fn = runDirectInstall()
   } else if (mode === 'mo2') {
     fn = runMO2Install()
+  } else if (mode === 'modlist') {
+    fn = runMO2Install({ modlistOnly: true })
   } else {
     // Auto mode (used by the Play button) - delegate based on mo2Enabled setting
     fn = store.get('mo2Enabled') ? runMO2Install() : runDirectInstall()
@@ -1409,6 +1554,58 @@ ipcMain.on('install:cancel', () => {
   if (installing && installAbort) installAbort.abort()
 })
 
+// Standalone install steps (Installation tab buttons). Both stream their
+// progress over the same install:progress channel as the full installers.
+
+// MO2 only: download/unpack MO2 and refresh the portable instance.
+ipcMain.handle('install:mo2only', async () => {
+  if (installing) return { success: false, error: 'An install is already running - cancel it first.' }
+  installing = true
+  try {
+    await mo2.ensureInstalled(msg =>
+      send('install:progress', { phase: 'download', file: msg, index: 0, total: 0, skipped: false }))
+    const gamePath = effectiveGamePath()
+    if (gamePath && fs.existsSync(path.join(gamePath, 'SkyrimSE.exe'))) {
+      let serverInfo = null
+      try { serverInfo = await fetchJSON(`${config.apiUrl}/api/serverinfo`) } catch {}
+      mo2.ensureInstance(gamePath, serverInfo?.loadOrder)
+      mo2.registerNxmHandler()
+    }
+    return { success: true }
+  } catch (err) {
+    return { success: false, error: err.message }
+  } finally {
+    installing = false
+  }
+})
+
+// SKSE only: download the edition-matched SKSE and install it into the game root.
+ipcMain.handle('install:skse', async () => {
+  if (installing) return { success: false, error: 'An install is already running - cancel it first.' }
+  // With isolation on, SKSE must land in the portable copy, never the original install
+  let gamePath
+  if (store.get('isolatedGame')) {
+    gamePath = isolatedGameDir()
+    if (!isolatedGameReady()) {
+      return { success: false, error: 'Install the game copy first - SKSE belongs in the portable copy, not your original Skyrim.' }
+    }
+  } else {
+    gamePath = effectiveGamePath()
+  }
+  if (!gamePath || !fs.existsSync(path.join(gamePath, 'SkyrimSE.exe'))) {
+    return { success: false, error: 'No game folder found - install the game copy or set a valid Skyrim path first.' }
+  }
+  installing = true
+  try {
+    await installSkseIntoRoot(gamePath)
+    return { success: true }
+  } catch (err) {
+    return { success: false, error: err.message }
+  } finally {
+    installing = false
+  }
+})
+
 // Shared download + extract helpers
 
 /**
@@ -1419,32 +1616,48 @@ function downloadClientZip(tempPath, onProgress) {
   const url = `${config.apiUrl}/api/files/zip`
   return new Promise((resolve, reject) => {
     try { assertSecureDownloadUrl(url) } catch (err) { return reject(err) }
+    let file = null
+    let settled = false
+    const finish = () => { if (!settled) { settled = true; resolve() } }
+    // Destroy the stream before unlinking: an open handle leaves the partial file delete-pending on Windows and blocks every retry this session.
+    const fail = err => {
+      if (settled) return
+      settled = true
+      if (file && !file.destroyed) {
+        file.once('close', () => { try { fs.unlinkSync(tempPath) } catch {} reject(err) })
+        file.destroy()
+      } else {
+        try { fs.unlinkSync(tempPath) } catch {}
+        reject(err)
+      }
+    }
     const mod = url.startsWith('https') ? https : http
     const req = mod.get(url, res => {
       if (res.statusCode === 404) {
         res.resume()
-        return reject(new Error('Update package not found on server. Run npm run merge on the backend.'))
+        return fail(new Error('Update package not found on server. Run npm run merge on the backend.'))
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume()
-        return reject(new Error(`Server returned HTTP ${res.statusCode}`))
+        return fail(new Error(`Server returned HTTP ${res.statusCode}`))
       }
 
       const total    = parseInt(res.headers['content-length'] || '0', 10)
       let   received = 0
 
-      const file = fs.createWriteStream(tempPath)
+      file = fs.createWriteStream(tempPath)
       res.on('data', chunk => {
         received += chunk.length
         if (onProgress) onProgress(received, total)
       })
       res.pipe(file)
-      file.on('finish', () => file.close(resolve))
-      file.on('error', err => { try { fs.unlinkSync(tempPath) } catch {} reject(err) })
-      res.on('error',  err => { try { fs.unlinkSync(tempPath) } catch {} reject(err) })
+      file.on('finish', () => file.close(finish))
+      file.on('error', fail)
+      res.on('error',  fail)
+      res.on('aborted', () => fail(new Error('Download interrupted')))
     })
-    req.on('error', reject)
-    req.setTimeout(60_000, () => { req.destroy(); reject(new Error('Download timed out')) })
+    req.on('error', fail)
+    req.setTimeout(60_000, () => { req.destroy(); fail(new Error('Download timed out')) })
   })
 }
 
@@ -1619,7 +1832,8 @@ async function installSkseIntoRoot(skyrimPath) {
   mo2.installSkse(path.join(mo2.getDownloadsDir(), name), skyrimPath)
 }
 
-async function runMO2Install() {
+async function runMO2Install(opts = {}) {
+  const modlistOnly = opts.modlistOnly === true
   _downloadListOpened = false
   const fail = (msg) => {
     log('[mo2-install] ABORT:', msg)
@@ -1658,9 +1872,13 @@ async function runMO2Install() {
     seedProfilePrefs(store.get('skyrimPath') || skyrimPath)
     applyForcedServerDefaults(skyrimPath)
 
-    // 2. SkyMP client files into the real Data/
-    const core = await installClientFilesCore(skyrimPath, srv, serverInfo)
-    if (!core.success) return fail(core.error)
+    // 2. SkyMP client files into the real Data/ (skipped by Install Modlist)
+    let coreUpToDate = false
+    if (!modlistOnly) {
+      const core = await installClientFilesCore(skyrimPath, srv, serverInfo)
+      if (!core.success) return fail(core.error)
+      coreUpToDate = !!core.upToDate
+    }
 
     // 3. Mods from the compiled install manifest
     let manifest
@@ -1698,7 +1916,7 @@ async function runMO2Install() {
       finishOrder()
       store.set('modpackState', 'ready')
       send('install:complete', {
-        success: true, mo2: true, upToDate: core.upToDate, modsTotal: 0,
+        success: true, mo2: true, upToDate: coreUpToDate, modsTotal: 0,
         warning: [vanillaWarning, 'The install manifest has no mods yet - compile it from the reference MO2 install on the backend.']
           .filter(Boolean).join(' | '),
       })
@@ -1875,7 +2093,7 @@ async function runMO2Install() {
 
     store.set('modpackState', 'ready')
     send('install:complete', {
-      success: true, mo2: true, upToDate: core.upToDate, modsTotal: manifest.mods.length,
+      success: true, mo2: true, upToDate: coreUpToDate, modsTotal: manifest.mods.length,
       ...(vanillaWarning ? { warning: vanillaWarning } : {}),
     })
   } catch (err) {

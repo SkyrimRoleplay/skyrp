@@ -28,7 +28,11 @@ fails it prints a direct download URL - save that zip as
   - The log tail asks nssm where each service writes its stdout/stderr
     (`nssm get <svc> AppStdout`) instead of guessing a fixed folder, so it always
     shows the real run output regardless of where the install script put the logs.
-  - Typed commands go to the game server over the backend WS relay (admin
+  - The command box first checks for **manager commands** and runs them locally:
+    `help`, `status`, `start|stop|restart <nginx|backend|game|all>`, and
+    `build <server|launcher|client>` (build output streams into the
+    console log; one build at a time).
+  - Anything else goes to the game server over the backend WS relay (admin
     `console` role) and the gamemode's command output streams back into the
     console. See **Wiring the console** below.
 - **Players** - a searchable player list on the left, an editable detail panel on
@@ -67,7 +71,7 @@ Each Build button then does the JS/packaging work:
 
 | Button | Does |
 |--------|------|
-| **Game Server** | Bundles the TypeScript → `build/dist/server/dist_back/skymp5-server.js`, then prunes `build/dist/server` to the deploy set. `scam_native.node` (from CI) is preserved. |
+| **Game Server** | Bundles the TypeScript → `build/dist/server/dist_back/skymp5-server.js`, then prunes `build/dist/server` to the deploy set. `scam_native.node` (from CI) and `gamemode.js` are preserved. |
 | **Launcher** | Builds the Electron installer `SkyrimRoleplayLauncher.exe` → `build/launcher`. |
 | **Client** | Runs the backend `build-client` script (`populate-files.js` + `merge-files.js`) to zip `build/dist/client/Data` into `skymp-client.zip` + `data/files-version.json` for the launcher to download. The version is taken from `CLIENT_VERSION` in the backend `.env` - set it from the **Client** version field before building. |
 
@@ -113,12 +117,12 @@ The relay (`skymp5-backend/sources/wsRelay.js`) already accepts the admin
 `console` role, forwards `console_command` to the gamemode, and fans the
 gamemode's `console_output` back to every connected console.
 
-The one piece that lives outside this repo is the **gamemode handler** that
-actually runs a command - the gamemode (`skymp5-functions-lib`) is fetched and
-built separately. A ready-to-drop-in reference handler is provided at
-[`gamemode-console-handler.example.js`](gamemode-console-handler.example.js):
-add its `console_command` branch to the gamemode's relay socket and rebuild the
-gamemode. Until then, commands are delivered and acknowledged but not executed.
+The gamemode side lives in `build/dist/server/gamemode.js` (managed directly on
+the server box, gitignored): it connects to the relay as the `gamemode` role and
+executes `help`, `status`, `players`, `say <text>`, `notify <name|all> <text>`,
+`kick <name>`, and `admin list|add|remove <profileId>`. It reads `WS_PORT` /
+`RELAY_SECRET` from `skymp5-backend/.env` automatically. If the Console reports
+"game console offline", the game server (or its relay connection) is down.
 
 ## Configuration (environment variables)
 

@@ -1,7 +1,8 @@
 {
   "name": "skyrp-launcher",
-  "version": "2.0.2",
-  "description": "Launcher for the Skyrim Roleplay server",
+  "version": "2.1.1",
+  "description": "Launcher for the SkyRP server",
+  "productName": "SkyRP Launcher",
   "main": "src/main.js",
   "author": "F02K and Suraru",
   "license": "MIT",
@@ -34,6 +35,12 @@
       "assets/**/*",
       "!assets/7zip/**",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/7zip",
+        "to": "7zip"
+      }
     ],
     "win": {
       "target": [

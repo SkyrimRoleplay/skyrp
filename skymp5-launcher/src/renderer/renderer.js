@@ -19,7 +19,8 @@ document.querySelectorAll('.topnav-link[data-href]').forEach(link => {
 // Settings modal
 const modalOverlay = document.getElementById('modal-settings')
 
-function openModal() { modalOverlay.hidden = false; loadGameSettingsTab() }
+// loadSettings re-runs main's registry auto-detect and refreshes the path fields.
+function openModal() { modalOverlay.hidden = false; loadSettings(); loadGameSettingsTab() }
 function closeModal() { modalOverlay.hidden = true }
 
 document.getElementById('btn-gear').addEventListener('click', openModal)
@@ -135,6 +136,15 @@ async function saveGameSettingsTab() {
 
 // Form fields
 const fieldSkyrimPath   = document.getElementById('setting-skyrim-path')
+const fieldBaseDir      = document.getElementById('setting-base-dir')
+const skyrimPathWarning = document.getElementById('skyrim-path-warning')
+
+const DETECT_FAIL_MSG = 'Could not auto-detect Skyrim - set the path manually'
+
+function setPathWarning(msg) {
+  skyrimPathWarning.textContent = msg || ''
+  skyrimPathWarning.hidden = !msg
+}
 
 // Footer server selector
 const footerServerName   = document.getElementById('footer-server-name')
@@ -194,6 +204,9 @@ function updateLockState() {
 async function loadSettings() {
   const s = await window.electronAPI.loadSettings()
   fieldSkyrimPath.value = s.skyrimPath || ''
+  // Empty here means main's registry auto-detect already failed.
+  setPathWarning(s.skyrimPath ? '' : DETECT_FAIL_MSG)
+  fieldBaseDir.value = s.baseDirPath || ''
 
   // Footer server selector - dropdown when >1 server, plain text otherwise
   if (s.servers && s.servers.length > 1) {
@@ -394,26 +407,30 @@ const isolatedText      = document.getElementById('isolated-status-text')
 const fieldIsolated     = document.getElementById('setting-isolated-game')
 const btnCreateIsolated = document.getElementById('btn-create-isolated')
 const btnInstallMo2     = document.getElementById('btn-install-mo2')
+const btnInstallSkse    = document.getElementById('btn-install-skse')
+const btnInstallClient  = document.getElementById('btn-install-client')
+const btnFullInstall    = document.getElementById('btn-full-install')
 const isolatedGroup     = document.getElementById('isolated-install-group')
 
-// locks install via mo2 until there's a game to manage
+// locks the full install until there's a game to manage
 function refreshDownloadModsState(st) {
   if (mo2InstallRunning) return  // button is in Cancel mode; don't fight it
   const ready = !fieldIsolated.checked || st.ready
-  btnInstallMo2.disabled = !ready
-  btnInstallMo2.title = ready
+  btnFullInstall.disabled = !ready
+  btnFullInstall.title = ready
     ? ''
     : 'Install the game files first, or turn off Portable Skyrim Mode in the Troubleshooting tab.'
 }
 
 async function refreshIsolatedStatus() {
   const st = await window.electronAPI.isolatedStatus()
-  // Portable mode off: the whole "choose install location" section is
-  // irrelevant, so hide it instead of explaining it.
+  // Portable mode off: the game-copy button and status are irrelevant,
+  // so hide them instead of explaining them.
   isolatedGroup.hidden = !fieldIsolated.checked
+  btnCreateIsolated.hidden = !fieldIsolated.checked
   if (!st.ready) {
     isolatedDot.className    = 'vortex-status-dot'
-    isolatedText.textContent = 'Not installed yet - choose a location to set up SkyRP'
+    isolatedText.textContent = 'Game copy not installed yet - use Install Game Copy'
   } else if (!fieldIsolated.checked) {
     isolatedDot.className    = 'vortex-status-dot dot-warn'
     isolatedText.textContent = 'SkyRP install exists - playing from the original Skyrim'
@@ -426,30 +443,28 @@ async function refreshIsolatedStatus() {
 
 btnCreateIsolated.addEventListener('click', async () => {
   btnCreateIsolated.disabled = true
-  btnCreateIsolated.textContent = 'Copying…'
 
   window.electronAPI.removeIsolatedListeners()
-  // Game-copy steps run in the bottom install-status field; the line next to
-  // this button stays on the not-installed/installed status only.
-  window.electronAPI.onIsolatedProgress(msg => {
-    installStatusMo2.textContent = msg
-  })
+  // Game-copy steps stream into the shared install progress log.
+  window.electronAPI.onIsolatedProgress(msg => installLive(msg))
+  installLog('Installing game copy…')
 
-  const result = await window.electronAPI.createIsolated()
+  const result = await window.electronAPI.createIsolated(fieldBaseDir.value.trim())
   window.electronAPI.removeIsolatedListeners()
 
   btnCreateIsolated.disabled = false
-  btnCreateIsolated.textContent = 'Choose location & install…'
 
   if (!result.success) {
-    installStatusMo2.textContent = `Error: ${result.error}`
+    installLog(`Error: ${result.error}`)
     return
   }
+  // The base may have been nested under \SkyRP - reflect what was used.
+  if (result.dir) fieldBaseDir.value = result.dir
+  installLog('Game copy ready ✓')
   fieldIsolated.checked = true
   await window.electronAPI.saveSettings({ isolatedGame: true })
   refreshIsolatedStatus()
   refreshPlayState()
-  startModpackInstall()
 })
 
 fieldIsolated.addEventListener('change', refreshIsolatedStatus)
@@ -457,6 +472,7 @@ fieldIsolated.addEventListener('change', refreshIsolatedStatus)
 document.getElementById('btn-save').addEventListener('click', async () => {
   const data = {
     skyrimPath:   fieldSkyrimPath.value.trim(),
+    baseDirPath:  fieldBaseDir.value.trim(),
     mo2Enabled:   fieldMo2Enabled.checked,
     isolatedGame: fieldIsolated.checked,
   }
@@ -473,7 +489,24 @@ document.getElementById('btn-save').addEventListener('click', async () => {
 // Browse folder
 document.getElementById('btn-browse').addEventListener('click', async () => {
   const folder = await window.electronAPI.openFolder()
-  if (folder) fieldSkyrimPath.value = folder
+  if (folder) { fieldSkyrimPath.value = folder; setPathWarning('') }
+})
+
+// Browse install location (dialog fallback for the Install Location field)
+document.getElementById('btn-browse-base').addEventListener('click', async () => {
+  const folder = await window.electronAPI.openFolder('Choose where to install SkyRP (~16 GB: MO2 + game copy)')
+  if (folder) fieldBaseDir.value = folder
+})
+
+// Detect Skyrim from the registry (persists on success)
+document.getElementById('btn-detect-path').addEventListener('click', async () => {
+  const r = await window.electronAPI.detectSkyrimPath()
+  if (r && r.path) {
+    fieldSkyrimPath.value = r.path
+    setPathWarning('')
+  } else {
+    setPathWarning(DETECT_FAIL_MSG)
+  }
 })
 
 // MO2 UI
@@ -491,7 +524,7 @@ async function refreshMo2Status() {
 
   if (!status.installed) {
     mo2StatusDot.className    = 'vortex-status-dot'
-    mo2StatusText.textContent = 'MO2 not installed yet - run "Install Modpack via MO2" below'
+    mo2StatusText.textContent = 'MO2 not installed yet - use Install MO2'
   } else if (!enabled) {
     mo2StatusDot.className    = 'vortex-status-dot dot-warn'
     mo2StatusText.textContent = `MO2 ${status.version} ready (${status.modCount} mods) - launching without it`
@@ -539,85 +572,127 @@ document.getElementById('btn-launch-direct').addEventListener('click', async () 
   troubleLaunchStatus.textContent = r.success ? 'Launched ✓' : `Error: ${r.error}`
 })
 
+// Installation tab: shared install progress log
+// All five install buttons stream their progress into the one <pre> below them.
+const installProgressEl = document.getElementById('install-progress')
+let installLogLines = []
+let installLiveLine = ''
+
+function renderInstallProgress() {
+  installProgressEl.textContent = installLogLines.concat(installLiveLine ? [installLiveLine] : []).join('\n')
+  installProgressEl.scrollTop = installProgressEl.scrollHeight
+}
+// Transient line (per-file progress) - overwritten by the next update.
+function installLive(msg) { installLiveLine = msg; renderInstallProgress() }
+// Permanent line (start/finish/error) - settles the current live line first.
+function installLog(msg) {
+  if (installLiveLine) { installLogLines.push(installLiveLine); installLiveLine = '' }
+  installLogLines.push(msg)
+  if (installLogLines.length > 300) installLogLines.splice(0, installLogLines.length - 300)
+  renderInstallProgress()
+}
+
+function formatInstallProgress({ phase, file, index, total, skipped }) {
+  if (phase === 'download') return file
+  if (phase === 'mods') return total > 0 ? `[mods ${index}/${total}] ${file}` : file
+  return `${skipped ? '[skip]' : `[${index}/${total}]`} ${file}`
+}
+
+// Single owner of the install channels, attached once: progress always feeds
+// the shared pane (plus an optional per-flow mirror) and completion resolves
+// whichever flow started the install. Nothing detaches these, so a second
+// button click can no longer strand a running install's events.
+let installCompleteHandler = null
+let installProgressMirror = null
+window.electronAPI.onInstallProgress(p => {
+  if (installProgressMirror) installProgressMirror(p)
+  installLive(formatInstallProgress(p))
+})
+window.electronAPI.onInstallComplete(d => {
+  const cb = installCompleteHandler
+  installCompleteHandler = null
+  installProgressMirror = null
+  if (cb) cb(d)
+})
+
+function installBusy() {
+  if (installCompleteHandler) { installLog('An install is already running.'); return true }
+  return false
+}
+
+// Install MO2 (standalone)
+btnInstallMo2.addEventListener('click', async () => {
+  btnInstallMo2.disabled = true
+  installLog('Installing Mod Organizer 2…')
+  const r = await window.electronAPI.installMo2Only()
+  installLog(r.success ? 'MO2 installed ✓' : `Error: ${r.error}`)
+  btnInstallMo2.disabled = false
+  refreshMo2Status()
+})
+
+// Install SKSE (standalone)
+btnInstallSkse.addEventListener('click', async () => {
+  btnInstallSkse.disabled = true
+  installLog('Installing SKSE…')
+  const r = await window.electronAPI.installSkse()
+  installLog(r.success ? 'SKSE installed ✓' : `Error: ${r.error}`)
+  btnInstallSkse.disabled = false
+})
+
 // Install / Update Client Files
-const installStatusClient = document.getElementById('install-status-client')
-
-document.getElementById('btn-install-client').addEventListener('click', () => {
-  installStatusClient.textContent = 'Starting install…'
-  window.electronAPI.removeInstallListeners()
-
-  window.electronAPI.onInstallProgress(({ phase, file, index, total, skipped }) => {
-    if (phase === 'download') {
-      installStatusClient.textContent = file
-    } else {
-      const prefix = skipped ? '[skip]' : `[${index}/${total}]`
-      installStatusClient.textContent = `${prefix} ${file}`
-    }
-  })
-
-  window.electronAPI.onInstallComplete(({ success, error, upToDate }) => {
+btnInstallClient.addEventListener('click', () => {
+  if (installBusy()) return
+  btnInstallClient.disabled = true
+  installCompleteHandler = (({ success, error, upToDate }) => {
+    btnInstallClient.disabled = false
     if (!success) {
-      installStatusClient.textContent = `Error: ${error}`
+      installLog(`Error: ${error}`)
       return
     }
-    installStatusClient.textContent = upToDate ? 'Client files up to date ✓' : 'Client files installed ✓'
+    installLog(upToDate ? 'Client files up to date ✓' : 'Client files installed ✓')
   })
-
+  installLog('Installing client files…')
   window.electronAPI.startInstall('client')
 })
 
-// Install Modpack via MO2
-const installStatusMo2 = document.getElementById('install-status-mo2')
-
+// Full install (MO2 + client files + modpack manifest)
 let mo2InstallRunning = false
 
 function startModpackInstall() {
   // While an install runs the same button cancels it, so a wedged install
   // can always be stopped and retried without restarting the launcher.
   if (mo2InstallRunning) {
-    installStatusMo2.textContent = 'Cancelling…'
+    installLog('Cancelling…')
     window.electronAPI.cancelInstall()
     return
   }
+  if (installBusy()) return
   mo2InstallRunning = true
-  btnInstallMo2.textContent = 'Cancel Install'
-  installStatusMo2.textContent = 'Starting MO2 install…'
-  window.electronAPI.removeInstallListeners()
+  btnFullInstall.textContent = 'Cancel Install'
+  installLog('Installing modlist…')
 
-  window.electronAPI.onInstallProgress(({ phase, file, index, total, skipped }) => {
-    if (phase === 'download') {
-      installStatusMo2.textContent = file
-    } else if (phase === 'mods') {
-      installStatusMo2.textContent = total > 0 ? `[mods ${index}/${total}] ${file}` : file
-    } else {
-      const prefix = skipped ? '[skip]' : `[${index}/${total}]`
-      installStatusMo2.textContent = `${prefix} ${file}`
-    }
-  })
-
-  window.electronAPI.onInstallComplete(({ success, error, upToDate, warning, modsTotal }) => {
+  installCompleteHandler = (({ success, error, upToDate, warning, modsTotal }) => {
     mo2InstallRunning = false
-    btnInstallMo2.textContent = 'Install Modpack via MO2'
+    btnFullInstall.textContent = 'Install Modlist'
     // Keep the Play button honest right away instead of waiting for the 10s
     // poll - otherwise a stale UPDATE label eats the player's next click.
     refreshPlayState()
     if (!success) {
-      installStatusMo2.textContent = `Error: ${error}`
+      installLog(`Error: ${error}`)
       return
     }
     if (warning) {
-      installStatusMo2.textContent = `⚠ ${warning}`
+      installLog(`⚠ ${warning}`)
       refreshMo2Status()
       return
     }
-    const files = upToDate ? 'client files up to date' : 'client files installed'
-    installStatusMo2.textContent = `Modpack ready ✓ - ${modsTotal ?? 0} mods, ${files}`
+    installLog(upToDate ? `Modlist up to date ✓ - ${modsTotal ?? 0} mods` : `Modlist ready ✓ - ${modsTotal ?? 0} mods`)
     refreshMo2Status()
   })
 
-  window.electronAPI.startInstall('mo2')
+  window.electronAPI.startInstall('modlist')
 }
-btnInstallMo2.addEventListener('click', startModpackInstall)
+btnFullInstall.addEventListener('click', startModpackInstall)
 
 // PLAY button
 // One click does everything: verify/refresh client files, sync the load
@@ -647,7 +722,7 @@ function updatePlayButton() {
   if (!isoReady) {
     btnConnect.disabled    = false
     btnConnect.textContent = '\u2699 INSTALL'
-    btnConnect.title       = 'Set up your SkyRP game copy in Settings.'
+    btnConnect.title       = 'Installs SkyRP automatically, then launches.'
     return
   }
 
@@ -702,12 +777,14 @@ function clearWarning() {
 // mirroring progress onto the Play button / warning strip.
 function runInstallForPlay() {
   return new Promise(resolve => {
-    window.electronAPI.removeInstallListeners()
-    window.electronAPI.onInstallProgress(({ phase, file }) => {
+    if (installCompleteHandler) {
+      return resolve({ success: false, error: 'An install is already running - wait for it to finish.' })
+    }
+    installProgressMirror = ({ phase, file }) => {
       btnConnect.textContent = phase === 'download' ? '\u2913 DOWNLOADING\u2026' : '\u2699 INSTALLING\u2026'
       showWarning(file)
-    })
-    window.electronAPI.onInstallComplete(result => resolve(result))
+    }
+    installCompleteHandler = result => resolve(result)
     window.electronAPI.startInstall('auto')
   })
 }
@@ -715,27 +792,28 @@ function runInstallForPlay() {
 btnConnect.addEventListener('click', async () => {
   if (gameRunning || playBusy) return
 
-  // No game copy yet: the button reads INSTALL and leads to Settings,
-  // where the isolated-copy setup lives.
-  if (!isoReady) {
+  // settings:load re-runs the registry auto-detect for an empty/invalid path,
+  // so an empty result here means Skyrim really could not be found.
+  const s = await window.electronAPI.loadSettings()
+  if (!s.skyrimPath) {
+    showWarning('Could not auto-detect Skyrim - set the path manually in Settings.')
     openModal()
     return
   }
 
-  // Launch prerequisites. When an update is pending they don't block the
-  // update itself - the files still refresh, and the warning explains what
-  // is missing before the game can start.
+  // Launch prerequisites. A pending update or first-run install still runs -
+  // the files refresh, and the warning explains what is missing before the
+  // game can start.
   const blockers = []
   if (discordUser && !serverAllowed) {
     blockers.push(serverLocked
       ? 'Server is currently locked - you are not on the allow list.'
       : 'You are not on the server whitelist.')
   }
-  const s = await window.electronAPI.loadSettings()
-  if (!s.skyrimPath) blockers.push('Set Skyrim path in Settings first.')
-  if (!discordUser)  blockers.push('Login with Discord first - use the button in the toolbar.')
+  if (!discordUser) blockers.push('Login with Discord first - use the button in the toolbar.')
 
-  if (blockers.length > 0 && !updateAvailable) {
+  const needsGameCopy = !isoReady
+  if (blockers.length > 0 && !updateAvailable && !needsGameCopy) {
     showWarning(blockers[0])
     return
   }
@@ -745,9 +823,29 @@ btnConnect.addEventListener('click', async () => {
   clearWarning()
 
   try {
+    // 0. First run: create the game copy + MO2 at the default/current install
+    // location automatically instead of bouncing the player into Settings.
+    if (needsGameCopy) {
+      btnConnect.textContent = '\u2699 INSTALLING\u2026'
+      window.electronAPI.removeIsolatedListeners()
+      window.electronAPI.onIsolatedProgress(msg => showWarning(msg))
+      const created = await window.electronAPI.createIsolated()
+      window.electronAPI.removeIsolatedListeners()
+      if (!created.success) {
+        showWarning(created.error || 'Install failed.')
+        return
+      }
+      fieldIsolated.checked = true
+      await window.electronAPI.saveSettings({ isolatedGame: true })
+      refreshIsolatedStatus()
+      isoReady = true
+      clearWarning()
+    }
+
     // 1. Make sure client files are present and current (fast no-op when up
-    // to date; a pending update runs the full install pipeline here).
-    btnConnect.textContent = updateAvailable ? '\u2913 UPDATING\u2026' : '\u2699 CHECKING FILES\u2026'
+    // to date; a pending update or fresh install runs the full pipeline here).
+    btnConnect.textContent = needsGameCopy ? '\u2699 INSTALLING\u2026'
+      : (updateAvailable ? '\u2913 UPDATING\u2026' : '\u2699 CHECKING FILES\u2026')
     const install = await runInstallForPlay()
     if (!install.success) {
       showWarning(install.error || 'Update failed.')

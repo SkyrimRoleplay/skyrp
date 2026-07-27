@@ -92,9 +92,11 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 echo Configuring service: %SERVICE%
 "%NSSM%" stop %SERVICE% >nul 2>&1
 "%NSSM%" remove %SERVICE% confirm >nul 2>&1
-:: also clean up the old service name used by earlier versions of this script
+:: also clean up the old service names used by earlier versions of this script
 "%NSSM%" stop SkyRP-Backend >nul 2>&1
 "%NSSM%" remove SkyRP-Backend confirm >nul 2>&1
+"%NSSM%" stop SkyrpBackend >nul 2>&1
+"%NSSM%" remove SkyrpBackend confirm >nul 2>&1
 "%NSSM%" install %SERVICE% "%NODE_EXE%" "server.js"
 "%NSSM%" set %SERVICE% AppDirectory "%BACKEND_DIR%"
 "%NSSM%" set %SERVICE% AppStdout "%LOG_DIR%\backend.log"
@@ -105,6 +107,7 @@ echo Configuring service: %SERVICE%
 "%NSSM%" set %SERVICE% AppThrottle 5000
 
 :: Firewall
+netsh advfirewall firewall delete rule name="SkyRP WS Relay TCP 7778" >nul 2>&1
 netsh advfirewall firewall delete rule name="SkyRP WS Relay TCP 7778" >nul 2>&1
 netsh advfirewall firewall add  rule name="SkyRP WS Relay TCP 7778" dir=in action=allow protocol=TCP localport=7778
 

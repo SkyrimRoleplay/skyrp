@@ -238,6 +238,7 @@ function renderPlayers() {
           <th>Name</th>
           <th>Discord ID</th>
           <th>Access</th>
+          <th>HWID</th>
           <th>Factions</th>
           <th></th>
         </tr>
@@ -248,7 +249,8 @@ function renderPlayers() {
             <td>#${player.profileId}</td>
             <td>${escapeHtml(player.displayName || player.username || 'Unnamed')}</td>
             <td>${escapeHtml(player.discordId)}</td>
-            <td><span class="tag ${player.access?.allowed ? '' : 'locked'}">${escapeHtml(player.access?.allowed ? 'allowed' : (player.access?.error || 'blocked'))}</span></td>
+            <td><span class="tag ${player.access?.allowed ? '' : 'locked'}">${escapeHtml(player.access?.allowed ? 'allowed' : (player.access?.error || 'blocked'))}</span>${player.ban ? ' <span class="tag locked">banned</span>' : ''}</td>
+            <td>${escapeHtml(player.hwid ? player.hwid.slice(0, 12) : '-')}</td>
             <td>${escapeHtml((player.assignments || []).map(a => a.requirement ? `${a.requirement.group} ${a.requirement.rank}` : a.requirementId).join(', '))}</td>
             <td><button class="ghost mini" data-select-player="${player.profileId}" type="button">Open</button></td>
           </tr>
@@ -272,7 +274,7 @@ function renderPlayerDetail() {
   nodes.whitelistPlayerButton.textContent = player?.access?.roles?.includes(state.access?.whitelistRoleId)
     ? 'Remove Whitelist'
     : 'Add Whitelist'
-  nodes.banPlayerButton.textContent = player?.access?.roles?.includes(state.access?.bannedRoleId)
+  nodes.banPlayerButton.textContent = playerIsBanned(player)
     ? 'Remove Ban'
     : 'Add Ban'
   nodes.playerAssignmentsTable.innerHTML = player
@@ -588,10 +590,15 @@ async function toggleWhitelist() {
   toast(enabled ? 'Player whitelisted' : 'Player removed from whitelist')
 }
 
+// Banned when a bans.json snapshot exists or the discord ban role is present
+function playerIsBanned(player) {
+  return !!(player?.ban || player?.access?.roles?.includes(state.access?.bannedRoleId))
+}
+
 async function toggleBan() {
   const player = selectedPlayer()
   if (!player) return
-  const enabled = !player.access?.roles?.includes(state.access?.bannedRoleId)
+  const enabled = !playerIsBanned(player)
   await api(`/api/players/${player.profileId}/ban`, {
     method: 'PUT',
     body: JSON.stringify({ enabled }),
